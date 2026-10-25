@@ -1,0 +1,4 @@
+jdk:
+  - openjdk17
+install:
+  - ./gradlew :appeeky-analytics:publishToMavenLocal -x test
