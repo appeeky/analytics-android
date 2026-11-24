@@ -35,7 +35,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.appeeky:analytics-android:0.1.0")
+    implementation("com.github.appeeky:analytics-android:0.2.0")
 }
 ```
 

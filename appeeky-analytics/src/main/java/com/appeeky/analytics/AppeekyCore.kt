@@ -32,6 +32,21 @@ internal const val QUEUE_KEY = "@appeeky/analytics:queue"
 internal const val MAX_BATCH = 100
 private const val MAX_BACKOFF_MS = 5 * 60 * 1000L
 internal const val ATTRIBUTION_TIMEOUT_MS = 3_000L
+/** The hosted service answers this once the account's monthly event quota is used up. */
+private const val QUOTA_STATUS = 402
+/** Wait before sending ordinary events again after a quota answer; doubles up to the maximum. */
+private const val QUOTA_RETRY_MS = 15 * 60 * 1000L
+private const val MAX_QUOTA_RETRY_MS = 6 * 60 * 60 * 1000L
+/**
+ * Events the server stores even past the quota, and the queue never evicts
+ * before ordinary ones. Keep in step with CRITICAL_EVENT_NAMES in
+ * packages/core/src/service.ts.
+ */
+private val CRITICAL_EVENTS = setOf("first_open", "ad_revenue")
+/** A batch rejected this many times with the attribution in it: give the attribution up. */
+private const val MAX_ATTRIBUTION_REJECTS = 3
+/** Server limit (packages/core/src/ingest-payload.ts); longer values would reject the batch. */
+private const val MAX_URL_LENGTH = 2_048
 /** A single foreground stretch longer than this is clamped (clock jumps, stuck timers). */
 private const val MAX_FOREGROUND_MS = 4 * 60 * 60 * 1000L
 private val EVENT_NAME = Regex("^[A-Za-z0-9_.:-]+$")
@@ -96,6 +111,8 @@ internal class PersistedState(
     var sessionId: String? = null,
     var lastActiveAt: Long? = null,
     var attributionSent: Boolean = false,
+    /** Batches the server rejected (4xx) while carrying the attribution. */
+    var attributionRejects: Int = 0,
     /** First launch time. */
     var installedAt: Long? = null,
     /** The deferred deep link was already handed to the app. */
@@ -107,6 +124,7 @@ internal class PersistedState(
         sessionId?.let { put("sessionId", it) }
         lastActiveAt?.let { put("lastActiveAt", it) }
         if (attributionSent) put("attributionSent", true)
+        if (attributionRejects > 0) put("attributionRejects", attributionRejects)
         installedAt?.let { put("installedAt", it) }
         if (deepLinkDelivered) put("deepLinkDelivered", true)
     }
@@ -121,6 +139,7 @@ internal class PersistedState(
                 sessionId = map["sessionId"] as? String,
                 lastActiveAt = (map["lastActiveAt"] as? Number)?.toLong(),
                 attributionSent = map["attributionSent"] == true,
+                attributionRejects = (map["attributionRejects"] as? Number)?.toInt() ?: 0,
                 installedAt = (map["installedAt"] as? Number)?.toLong(),
                 deepLinkDelivered = map["deepLinkDelivered"] == true,
             )
@@ -254,6 +273,9 @@ internal class AppeekyCore(private val opts: CoreOptions, private val deps: Core
     /** When the app last came to the foreground; null while in the background. */
     private var foregroundSince: Long? = null
     private var retryAt = 0L
+    /** While now < quotaUntil only critical events are sent; the rest wait in the queue. */
+    private var quotaUntil = 0L
+    private var quotaBackoffMs = 0L
     @Volatile private var installIdValue: String? = null
 
     private val timers: Timers = deps.timers ?: object : Timers {
@@ -440,8 +462,8 @@ internal class AppeekyCore(private val opts: CoreOptions, private val deps: Core
         val (installReferrer, deepLinkUrl) = awaitAll(referrerJob, urlJob)
         deferredDeepLink = deferredDeepLinkFrom(installReferrer, deepLinkUrl)
         val out = LinkedHashMap<String, String>()
-        installReferrer?.trim()?.takeIf { it.isNotEmpty() }?.let { out["installReferrer"] = it.take(2_048) }
-        deepLinkUrl?.trim()?.takeIf { it.isNotEmpty() }?.let { out["deepLinkUrl"] = it.take(2_048) }
+        installReferrer?.trim()?.takeIf { it.isNotEmpty() }?.let { out["installReferrer"] = it.take(MAX_URL_LENGTH) }
+        deepLinkUrl?.trim()?.takeIf { it.isNotEmpty() }?.let { out["deepLinkUrl"] = it.take(MAX_URL_LENGTH) }
         attribution = out
     }
 
@@ -484,8 +506,10 @@ internal class AppeekyCore(private val opts: CoreOptions, private val deps: Core
             return
         }
         queue.add(QueuedEvent(deps.randomId(), name, deps.now(), st.sessionId, screen, props, value))
-        if (queue.size > opts.maxQueueSize) {
-            queue.subList(0, queue.size - opts.maxQueueSize).clear()
+        // Full: the oldest ordinary event goes first; first_open and ad revenue stay.
+        while (queue.size > opts.maxQueueSize) {
+            val oldest = queue.indexOfFirst { it.name !in CRITICAL_EVENTS }
+            queue.removeAt(if (oldest == -1) 0 else oldest)
         }
         persistQueue()
         if (queue.size >= opts.flushAt) beginFlush(false)
@@ -514,7 +538,8 @@ internal class AppeekyCore(private val opts: CoreOptions, private val deps: Core
             val st = state ?: return
             val pending = attribution
             val sendAttribution = !st.attributionSent && pending != null
-            val batch = queue.take(MAX_BATCH)
+            val quotaMode = deps.now() < quotaUntil
+            val batch = (if (quotaMode) queue.filter { it.name in CRITICAL_EVENTS } else queue).take(MAX_BATCH)
             if (batch.isEmpty() && !sendAttribution) return
 
             val body = LinkedHashMap<String, Any?>()
@@ -544,20 +569,58 @@ internal class AppeekyCore(private val opts: CoreOptions, private val deps: Core
                 log("warn", "batch not sent (HTTP $status), retrying in ${backoffMs / 1000}s")
                 return
             }
-            // 2xx: stored. Other 4xx: the server will never accept this batch, so
-            // drop it rather than retrying forever.
-            if (status >= 400) log("warn", "batch rejected with HTTP $status")
             backoffMs = 0
             retryAt = 0
+            val hadAttribution = body.containsKey("attribution")
+
+            if (status == QUOTA_STATUS) {
+                // Past the account's quota the server stored the install, its
+                // attribution and the critical events. The other events stay
+                // queued and are sent again later.
+                val stored = batch.filter { it.name in CRITICAL_EVENTS }.mapTo(HashSet()) { it.id }
+                queue.removeAll { it.id in stored }
+                if (sendAttribution) markAttributionSent(st)
+                persist()
+                persistQueue()
+                // Already waiting: go on with the critical events that are left.
+                if (quotaMode) continue
+                quotaBackoffMs = minOf(if (quotaBackoffMs > 0) quotaBackoffMs * 2 else QUOTA_RETRY_MS, MAX_QUOTA_RETRY_MS)
+                quotaUntil = deps.now() + quotaBackoffMs
+                log("warn", "event quota used up: installs and ad revenue are still sent, other events wait")
+                return
+            }
+
             val sent = batch.mapTo(HashSet()) { it.id }
             queue.removeAll { it.id in sent }
-            if (sendAttribution) {
-                st.attributionSent = true
-                attribution = null
+            if (status >= 400) {
+                // The server will never accept this batch: drop its events
+                // rather than retrying forever. The attribution is collected
+                // only once, so it rides on the next batches before it is
+                // given up.
+                log("warn", "batch rejected with HTTP $status")
+                if (hadAttribution) {
+                    st.attributionRejects += 1
+                    if (st.attributionRejects >= MAX_ATTRIBUTION_REJECTS) markAttributionSent(st)
+                } else if (sendAttribution) {
+                    markAttributionSent(st)
+                }
+            } else {
+                quotaBackoffMs = 0
+                quotaUntil = 0
+                if (sendAttribution) markAttributionSent(st)
             }
             persist()
             persistQueue()
+            // Rejected with the attribution still pending: wait for new events
+            // instead of sending the attribution alone in a loop.
+            if (status >= 400 && queue.isEmpty()) return
         }
+    }
+
+    private fun markAttributionSent(st: PersistedState) {
+        st.attributionSent = true
+        st.attributionRejects = 0
+        attribution = null
     }
 
     private fun persist() {

@@ -27,6 +27,8 @@ internal class MemoryStorage : KeyValueStorage {
     }
 
     fun queueSize(): Int = QueuedEvent.listFromJson(map[QUEUE_KEY]).size
+    fun queued(): List<String> = QueuedEvent.listFromJson(map[QUEUE_KEY]).map { it.name }
+    fun state(): PersistedState = PersistedState.fromJson(map[STATE_KEY])!!
 }
 
 /**

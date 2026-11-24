@@ -86,6 +86,167 @@ class AppeekyCoreTest {
         sdk2.flush(true)
         assertEquals(1, rejected.sent.size)
         assertEquals(0, rejected.store.queueSize())
+        // The attribution is not given up with the batch; it rides on the next one.
+        assertFalse(rejected.store.state().attributionSent)
+    }
+
+    @Test
+    fun `past the quota (402) the install is delivered and other events wait in the queue`() = runTest {
+        val h = Harness(testScheduler, statuses = listOf(402, 402, 202))
+        val sdk = h.make()
+        sdk.start()
+        sdk.flush(true)
+        // The server stored the install, its attribution and first_open.
+        assertEquals(1, h.sent.size)
+        assertNotNull(h.sent[0].attribution)
+        assertEquals(listOf("session_start"), h.store.queued())
+        assertTrue(h.store.state().attributionSent)
+
+        // While waiting, only critical events go out, without the attribution.
+        sdk.screen("Paywall")
+        sdk.adRevenue(0.02, null, null, null)
+        tick()
+        sdk.flush(true)
+        assertEquals(2, h.sent.size)
+        assertEquals(listOf("ad_revenue"), h.sent[1].events.map { it["name"] })
+        assertNull(h.sent[1].attribution)
+        assertEquals(listOf("session_start", "screen"), h.store.queued())
+
+        // Nothing ordinary is sent before the wait is over, even when forced.
+        sdk.flush(true)
+        assertEquals(2, h.sent.size)
+
+        h.advance(16 * 60 * 1000L)
+        sdk.flush()
+        assertEquals(3, h.sent.size)
+        assertEquals(listOf("session_start", "screen"), h.sent[2].events.map { it["name"] })
+        assertEquals(emptyList<String>(), h.store.queued())
+        h.sent.forEach { IngestSchema.validate(it.body) }
+    }
+
+    @Test
+    fun `a second quota answer doubles the wait and keeps the queue`() = runTest {
+        val h = Harness(testScheduler, statuses = listOf(402, 402, 402))
+        val sdk = h.make()
+        sdk.start()
+        sdk.flush(true)
+        h.advance(16 * 60 * 1000L)
+        sdk.flush()
+        assertEquals(2, h.sent.size)
+        h.advance(16 * 60 * 1000L) // the wait is 30 minutes now
+        sdk.flush()
+        assertEquals(2, h.sent.size)
+        h.advance(15 * 60 * 1000L)
+        sdk.flush()
+        assertEquals(3, h.sent.size)
+        assertEquals(listOf("session_start"), h.store.queued())
+    }
+
+    @Test
+    fun `an accepted batch ends the quota wait and its backoff`() = runTest {
+        val h = Harness(testScheduler, statuses = listOf(402, 202, 402))
+        val sdk = h.make()
+        sdk.start()
+        sdk.flush(true) // 402: wait 15 minutes
+        h.advance(16 * 60 * 1000L)
+        sdk.flush() // 202
+        assertEquals(emptyList<String>(), h.store.queued())
+        sdk.track("a", null, null)
+        tick()
+        sdk.flush(true) // 402 again: the wait starts over at 15 minutes
+        h.advance(16 * 60 * 1000L)
+        sdk.flush()
+        assertEquals(4, h.sent.size)
+        assertEquals(listOf("a"), h.sent[3].events.map { it["name"] })
+    }
+
+    @Test
+    fun `a rejected batch does not give up the attribution at once`() = runTest {
+        val h = Harness(testScheduler, statuses = listOf(400, 202))
+        val sdk = h.make()
+        sdk.start()
+        sdk.flush(true)
+        assertEquals(1, h.sent.size)
+        assertEquals(emptyList<String>(), h.store.queued())
+        assertFalse(h.store.state().attributionSent)
+        assertEquals(1, h.store.state().attributionRejects)
+
+        sdk.screen("Home")
+        tick()
+        sdk.flush(true)
+        assertEquals(2, h.sent.size)
+        assertEquals(mapOf("deepLinkUrl" to "myapp://open?aky_c=launch"), h.sent[1].attribution)
+        assertTrue(h.store.state().attributionSent)
+        assertEquals(0, h.store.state().attributionRejects)
+    }
+
+    @Test
+    fun `the attribution is given up after three rejected batches`() = runTest {
+        val h = Harness(testScheduler, statuses = listOf(400, 400, 400, 202))
+        val sdk = h.make()
+        sdk.start()
+        sdk.flush(true)
+        for (name in listOf("a", "b")) {
+            sdk.track(name, null, null)
+            tick()
+            sdk.flush(true)
+        }
+        assertEquals(3, h.sent.size)
+        assertTrue(h.store.state().attributionSent)
+        sdk.track("c", null, null)
+        tick()
+        sdk.flush(true)
+        assertNull(h.sent[3].attribution)
+    }
+
+    @Test
+    fun `a rejected batch without attribution values does not ask for them again`() = runTest {
+        val h = Harness(testScheduler, statuses = listOf(400), initialUrl = null)
+        val sdk = h.make()
+        sdk.start()
+        sdk.flush(true)
+        assertEquals(1, h.sent.size)
+        assertNull(h.sent[0].attribution)
+        assertTrue(h.store.state().attributionSent)
+    }
+
+    @Test
+    fun `a full queue evicts ordinary events before first_open and ad revenue`() = runTest {
+        val h = Harness(testScheduler, statuses = listOf(-1))
+        val sdk = h.make(maxQueueSize = 3)
+        sdk.start()
+        sdk.flush(true) // offline: session_start and first_open stay queued
+        sdk.adRevenue(0.01, null, null, null)
+        sdk.screen("A")
+        sdk.screen("B")
+        tick()
+        assertEquals(listOf("first_open", "ad_revenue", "screen"), h.store.queued())
+    }
+
+    @Test
+    fun `a queue of only critical events evicts the oldest`() = runTest {
+        val h = Harness(testScheduler, statuses = listOf(-1))
+        val sdk = h.make(maxQueueSize = 2)
+        sdk.start()
+        sdk.flush(true) // offline: session_start and first_open stay queued
+        sdk.adRevenue(0.01, null, null, null)
+        sdk.adRevenue(0.02, null, null, null)
+        tick()
+        assertEquals(listOf("ad_revenue", "ad_revenue"), h.store.queued())
+    }
+
+    @Test
+    fun `over-long attribution values are cut to the server's limits`() = runTest {
+        val h = Harness(
+            testScheduler,
+            referrer = { "utm_source=" + "x".repeat(3_000) },
+            initialUrl = { "myapp://open?aky_c=" + "y".repeat(3_000) },
+        )
+        val sdk = h.make()
+        sdk.start()
+        sdk.flush(true)
+        assertEquals(2_048, (h.sent[0].attribution?.get("installReferrer") as String).length)
+        assertEquals(2_048, (h.sent[0].attribution?.get("deepLinkUrl") as String).length)
     }
 
     @Test
@@ -391,7 +552,8 @@ class AppeekyCoreTest {
         sdk.flush(true)
         val sizes = h.sent.drop(1).map { it.events.size }
         assertEquals(listOf(100, 50), sizes)
-        assertEquals("e50", h.sent[1].events[0]["name"]) // session_start, first_open, e0..e49 dropped
+        // session_start and e0..e50 dropped; first_open is never evicted before them.
+        assertEquals(listOf("first_open", "e51"), h.sent[1].events.take(2).map { it["name"] })
     }
 
     @Test
