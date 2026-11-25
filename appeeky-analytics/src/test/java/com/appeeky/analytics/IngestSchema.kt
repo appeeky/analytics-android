@@ -17,7 +17,7 @@ internal object IngestSchema {
         shortText(body["sdk"], 64, "sdk")
 
         (body["context"] as? Map<*, *>)?.let { context ->
-            keys(context, "context", setOf("platform", "appVersion", "build", "osVersion", "deviceModel", "locale", "userId"))
+            keys(context, "context", setOf("platform", "appVersion", "build", "osVersion", "deviceModel", "locale", "userId", "testDevice"))
             context["platform"]?.let { assertTrue("platform: $it", it == "ios" || it == "android") }
             shortText(context["appVersion"], 64, "context.appVersion")
             shortText(context["build"], 64, "context.build")
@@ -25,6 +25,7 @@ internal object IngestSchema {
             shortText(context["deviceModel"], 128, "context.deviceModel")
             shortText(context["locale"], 35, "context.locale")
             shortText(context["userId"], 256, "context.userId")
+            context["testDevice"]?.let { assertTrue("context.testDevice: $it", it is Boolean) }
         }
 
         (body["attribution"] as? Map<*, *>)?.let { attribution ->

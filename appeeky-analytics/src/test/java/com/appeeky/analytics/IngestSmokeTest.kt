@@ -29,7 +29,7 @@ class IngestSmokeTest {
         val storage = MemoryStorage()
         val statuses = mutableListOf<Int>()
         val http = HttpTransport()
-        val transport = Transport { url, headers, body -> http.post(url, headers, body).also { statuses.add(it) } }
+        val transport = Transport { url, headers, body -> http.post(url, headers, body).also { statuses.add(it.status) } }
         fun deps() = CoreDeps(
             storage = storage,
             transport = transport,

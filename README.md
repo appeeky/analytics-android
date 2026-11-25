@@ -35,7 +35,7 @@ dependencyResolutionManagement {
 
 // app/build.gradle.kts
 dependencies {
-    implementation("com.github.appeeky:analytics-android:0.2.0")
+    implementation("com.github.appeeky:analytics-android:0.3.0")
 }
 ```
 
@@ -75,6 +75,7 @@ class App : Application() {
 | `options.maxQueueSize` | `1000` | Oldest events are dropped beyond this |
 | `options.sessionTimeoutMs` | `1800000` | Time in the background before a new session starts |
 | `options.disabled` | `false` | Collect and send nothing, for example after an opt-out |
+| `options.testDevice` | `null` | `true` or `false` marks the install as a test or a real one; `null` detects it (see [Test installs](#test-installs)) |
 
 ```kotlin
 Appeeky.configure(
@@ -101,6 +102,9 @@ Appeeky.identify(id)
 // On logout:
 Appeeky.identify(null)
 ```
+
+`identify` can be called on every launch: an id that has not changed sends
+nothing.
 
 Superwall: pass the same user id you give `Superwall.instance.identify(userId)`;
 Superwall's webhook events are matched to the install by it.
@@ -162,11 +166,19 @@ loaded its state).
 | `first_open` | First launch after install |
 | `session_start` | Launch, or returning after `sessionTimeoutMs` in the background |
 | `app_background` | Going to the background, with `foreground_ms`: time on screen since the app came to the foreground. Session time is the sum per session. |
-| `identify` / `reset` | `identify(id)` / `identify(null)` |
+| `identify` / `reset` | `identify(id)` with a new id / `identify(null)` after one was set |
 | `ad_revenue` | `adRevenue(valueUsd, …)` |
 
 Foreground and background come from `ProcessLifecycleOwner` (the whole app,
 not single Activities). Going to the background also sends the queue.
+
+## Test installs
+
+A debuggable build of your app and any build running on an emulator are
+reported as test installs. The server stores them and keeps them out of your
+reports; the dashboard's test data view shows them. To decide yourself, pass
+`options = AppeekyOptions(testDevice = true)` (or `false`, for example to
+count a debuggable QA build as a real install).
 
 ## Smart links and deep links
 
@@ -247,8 +259,8 @@ so nothing needs to be added to your app's rules.
 ## Privacy
 
 The SDK sends the install id, app version and build, Android version, device
-model, locale, the install referrer and launch URL of the first launch, and
-the events you track. It never reads the advertising id, Android id or other
+model, locale, whether the install is a test install, the install referrer
+and launch URL of the first launch, and the events you track. It never reads the advertising id, Android id or other
 device identifiers. In the Play Console's Data safety form, declare **App
 activity → App interactions** (and **Financial info → Purchase history** if
 you use RevenueCat or Superwall with Appeeky) as collected, not shared, and not used for

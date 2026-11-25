@@ -32,6 +32,8 @@ public data class AppeekyOptions @JvmOverloads constructor(
     public val sessionTimeoutMs: Long = 30 * 60 * 1000L,
     /** Collect nothing and send nothing (e.g. the user opted out). */
     public val disabled: Boolean = false,
+    /** Mark this install as a test install (true) or a real one (false); null detects debuggable builds and emulators. */
+    public val testDevice: Boolean? = null,
 )
 
 /**
@@ -105,7 +107,7 @@ public object Appeeky {
                     dispatcher = Dispatchers.IO.limitedParallelism(1),
                     now = System::currentTimeMillis,
                     randomId = { UUID.randomUUID().toString() },
-                    deviceContext = { androidDeviceContext(app) },
+                    deviceContext = { androidDeviceContext(app, options.testDevice) },
                     installReferrer = { readInstallReferrer(app) },
                     initialUrl = { launchUrl.await() },
                     log = { level, message ->
@@ -141,7 +143,8 @@ public object Appeeky {
 
     /**
      * Link this install to your RevenueCat app user id (or the id you give
-     * Superwall) so purchases get a source. Pass null on logout.
+     * Superwall) so purchases get a source. Pass null on logout. Safe to call
+     * on every launch: an id that did not change sends nothing.
      */
     @JvmStatic
     public fun identify(userId: String?) {

@@ -33,7 +33,8 @@ internal class MemoryStorage : KeyValueStorage {
 
 /**
  * Fake storage, network, clock and ids, like core.test.ts. Response statuses
- * are used in order (then 202); -1 throws like an offline device.
+ * are used in order (then 202); -1 throws like an offline device. A response
+ * body, if any, is the one at the same position in [bodies].
  */
 internal class Harness(
     scheduler: TestCoroutineScheduler,
@@ -41,19 +42,24 @@ internal class Harness(
     private val referrer: (suspend () -> String?)? = null,
     private val initialUrl: (suspend () -> String?)? = { "myapp://open?aky_c=launch" },
     private val context: DeviceContext = DeviceContext(platform = "android", osVersion = "15", locale = "tr-TR"),
+    bodies: List<String?> = emptyList(),
 ) {
     val store = MemoryStorage()
     val sent = mutableListOf<Sent>()
     var clock = 1_000_000L
     private var ids = 0
     private val responses = ArrayDeque(statuses)
+    private val responseBodies = ArrayDeque(bodies)
+    /** What the SDK logged, as "level: message". */
+    val logged = mutableListOf<String>()
     val dispatcher = StandardTestDispatcher(scheduler)
 
     val transport = Transport { url, headers, body ->
         sent.add(Sent(url, headers, body))
         val status = responses.removeFirstOrNull() ?: 202
+        val answer = responseBodies.removeFirstOrNull()
         if (status == -1) throw IOException("offline")
-        status
+        TransportResponse(status, answer)
     }
 
     private val timers = object : Timers {
@@ -67,6 +73,7 @@ internal class Harness(
         maxQueueSize: Int = 1_000,
         sessionTimeoutMs: Long = 30 * 60 * 1000L,
         disabled: Boolean = false,
+        debug: Boolean = false,
     ) = AppeekyCore(
         CoreOptions(
             key = "apk_test",
@@ -75,6 +82,7 @@ internal class Harness(
             maxQueueSize = maxQueueSize,
             sessionTimeoutMs = sessionTimeoutMs,
             disabled = disabled,
+            debug = debug,
         ),
         CoreDeps(
             storage = store,
@@ -86,6 +94,7 @@ internal class Harness(
             installReferrer = referrer,
             initialUrl = initialUrl,
             timers = timers,
+            log = { level, message -> logged.add("$level: $message") },
         ),
     )
 

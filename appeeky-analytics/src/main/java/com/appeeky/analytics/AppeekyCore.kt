@@ -50,6 +50,11 @@ private const val MAX_URL_LENGTH = 2_048
 /** A single foreground stretch longer than this is clamped (clock jumps, stuck timers). */
 private const val MAX_FOREGROUND_MS = 4 * 60 * 60 * 1000L
 private val EVENT_NAME = Regex("^[A-Za-z0-9_.:-]+$")
+/** Server warnings the SDK explains; others are ignored. */
+private val WARNING_TEXT = mapOf(
+    "platform_mismatch" to
+        "this key belongs to an app on the other store. Use the iOS app's key in the iOS build and the Android app's key in the Android build; until then both platforms are mixed in one app's reports.",
+)
 
 /** Small persisted values and the queue (files on Android). Blocking calls. */
 internal interface KeyValueStorage {
@@ -57,9 +62,12 @@ internal interface KeyValueStorage {
     fun setItem(key: String, value: String)
 }
 
-/** POSTs a JSON body and returns the HTTP status. Throws when the request could not be made. */
+/** An HTTP answer: the status and, when it could be read, the response body. */
+internal class TransportResponse(val status: Int, val body: String? = null)
+
+/** POSTs a JSON body and returns the answer. Throws when the request could not be made. */
 internal fun interface Transport {
-    suspend fun post(url: String, headers: Map<String, String>, body: String): Int
+    suspend fun post(url: String, headers: Map<String, String>, body: String): TransportResponse
 }
 
 internal interface Timers {
@@ -75,6 +83,11 @@ internal data class DeviceContext(
     val osVersion: String? = null,
     val deviceModel: String? = null,
     val locale: String? = null,
+    /**
+     * A debuggable build or an emulator. The server stores the install and
+     * keeps it out of reports.
+     */
+    val testDevice: Boolean = false,
 )
 
 internal data class CoreOptions(
@@ -239,7 +252,7 @@ private fun decode(s: String): String = try {
 }
 
 /** Context fields the ingest schema accepts: trimmed, non-empty, within its length limits. */
-private fun contextMap(context: DeviceContext, userId: String?): Map<String, String> = buildMap {
+private fun contextMap(context: DeviceContext, userId: String?): Map<String, Any> = buildMap {
     fun field(name: String, value: String?, max: Int) {
         val v = value?.trim()?.take(max)?.trim()
         if (!v.isNullOrEmpty()) put(name, v)
@@ -251,6 +264,14 @@ private fun contextMap(context: DeviceContext, userId: String?): Map<String, Str
     field("deviceModel", context.deviceModel, 128)
     field("locale", context.locale, 35)
     field("userId", userId, 256)
+    // Only ever sent as true; a real device leaves the field out.
+    if (context.testDevice) put("testDevice", true)
+}
+
+/** The `warnings` strings of a response body; empty for a missing or malformed body. */
+internal fun readWarnings(body: String?): List<String> {
+    val map = Json.parseOrNull(body) as? Map<*, *> ?: return emptyList()
+    return (map["warnings"] as? List<*>)?.filterIsInstance<String>() ?: emptyList()
 }
 
 internal class AppeekyCore(private val opts: CoreOptions, private val deps: CoreDeps) {
@@ -262,6 +283,8 @@ internal class AppeekyCore(private val opts: CoreOptions, private val deps: Core
     /** Null until collected; an empty map means there was nothing to send. */
     private var attribution: Map<String, String>? = null
     private var context = DeviceContext()
+    /** Server warnings already handled in this launch. */
+    private val warned = HashSet<String>()
     private var ready: Deferred<Unit>? = null
     /** Completes once first-launch attribution is collected; batches wait for it. */
     private var attributionReady: Deferred<Unit>? = null
@@ -396,6 +419,9 @@ internal class AppeekyCore(private val opts: CoreOptions, private val deps: Core
     fun identify(userId: String?) = whenReady {
         val st = state ?: return@whenReady
         val id = userId?.trim()?.take(256)?.trim()?.takeIf { it.isNotEmpty() }
+        // Apps call identify() on every launch. The id already rides on every
+        // batch's context, so only a change is worth an event.
+        if (id == st.userId) return@whenReady
         st.userId = id
         persist()
         // The user id rides on every batch's context; this event makes sure a
@@ -551,11 +577,14 @@ internal class AppeekyCore(private val opts: CoreOptions, private val deps: Core
 
             var status = 0
             try {
-                status = deps.transport.post(
+                val response = deps.transport.post(
                     opts.endpoint,
                     mapOf("Content-Type" to "application/json", "X-Appeeky-Key" to opts.key),
                     Json.encode(body),
                 )
+                status = response.status
+                // The server stored the batch (or, past the quota, part of it).
+                if (status in 200..299 || status == QUOTA_STATUS) reportWarnings(readWarnings(response.body))
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
@@ -637,6 +666,15 @@ internal class AppeekyCore(private val opts: CoreOptions, private val deps: Core
             deps.storage.setItem(QUEUE_KEY, Json.encode(queue.map { it.toMap() }))
         } catch (e: Exception) {
             log("warn", "could not save queue: ${e.message}")
+        }
+    }
+
+    /** Server warnings about a stored batch, said once per launch on a test device or with `debug`. */
+    private fun reportWarnings(warnings: List<String>) {
+        for (warning in warnings) {
+            if (!warned.add(warning)) continue
+            val text = WARNING_TEXT[warning] ?: continue
+            if (opts.debug || context.testDevice) deps.log("warn", text)
         }
     }
 

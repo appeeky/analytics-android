@@ -371,6 +371,141 @@ class AppeekyCoreTest {
     }
 
     @Test
+    fun `identify() with the same user id sends no second event`() = runTest {
+        val h = Harness(testScheduler)
+        val sdk = h.make()
+        sdk.start()
+        sdk.identify("rc_user_1")
+        tick()
+        sdk.flush(true)
+        val batches = h.sent.size
+        sdk.identify("rc_user_1")
+        sdk.identify("  rc_user_1  ")
+        tick()
+        sdk.flush(true)
+        assertEquals("an unchanged id sends no batch", batches, h.sent.size)
+        assertEquals(0, h.store.queueSize())
+        sdk.shutdown()
+
+        // A relaunch calls it again with the stored id.
+        val relaunched = h.make()
+        relaunched.start()
+        relaunched.identify("rc_user_1")
+        tick()
+        relaunched.flush(true)
+        assertEquals(1, h.allEvents.count { it["name"] == "identify" })
+        relaunched.identify("rc_user_2")
+        tick()
+        relaunched.flush(true)
+
+        assertEquals(2, h.allEvents.count { it["name"] == "identify" })
+        assertEquals("rc_user_2", h.sent.last().context["userId"])
+
+        // Logging out twice is one reset.
+        relaunched.identify(null)
+        relaunched.identify(null)
+        tick()
+        relaunched.flush(true)
+        assertEquals(1, h.allEvents.count { it["name"] == "reset" })
+        assertNull(h.sent.last().context["userId"])
+    }
+
+    @Test
+    fun `a test device says so in the context, and a real one leaves the field out`() = runTest {
+        val h = Harness(testScheduler, context = DeviceContext(osVersion = "15", testDevice = true))
+        val sdk = h.make()
+        sdk.start()
+        sdk.flush(true)
+        assertEquals(true, h.sent[0].context["testDevice"])
+        IngestSchema.validate(h.sent[0].body)
+
+        val real = Harness(testScheduler)
+        val other = real.make()
+        other.start()
+        other.flush(true)
+        assertFalse(real.sent[0].context.containsKey("testDevice"))
+        assertFalse("never sent as false", real.sent[0].raw.contains("testDevice"))
+    }
+
+    @Test
+    fun `the emulator is recognised by its build names`() {
+        assertTrue(isEmulator("sdk_gphone64_arm64", "sdk_gphone64_arm64", "ranchu", "google/sdk_gphone64_arm64/emu64a:15/AE3A/1:userdebug/dev-keys"))
+        assertTrue(isEmulator("Android SDK built for x86", "sdk_x86", "goldfish", "generic/sdk_x86/generic_x86:9/PSR1/1:eng/test-keys"))
+        assertTrue(isEmulator("Pixel 9", "tokay", "ranchu", "google/tokay/tokay:15/AP3A/1:user/release-keys"))
+        assertTrue(isEmulator("Custom", "custom", "custom", "generic_x86/custom/custom:11/RSR1/1:user/release-keys"))
+        assertFalse(isEmulator("Pixel 9", "tokay", "tokay", "google/tokay/tokay:15/AP3A/1:user/release-keys"))
+        assertFalse(isEmulator("SM-S921B", "e1sxeea", "s5e9945", "samsung/e1sxeea/e1s:14/UP1A/S921B:user/release-keys"))
+        assertFalse(isEmulator(null, null, null, null))
+    }
+
+    @Test
+    fun `a platform warning from the server is logged once on a test device`() = runTest {
+        val warning = "{\"accepted\":1,\"dropped\":0,\"warnings\":[\"platform_mismatch\",\"something_newer\",7]}"
+        val h = Harness(
+            testScheduler,
+            context = DeviceContext(osVersion = "15", testDevice = true),
+            bodies = listOf(warning, warning),
+        )
+        val sdk = h.make()
+        sdk.start()
+        sdk.flush(true)
+        sdk.track("again", null, null)
+        tick()
+        sdk.flush(true)
+        assertEquals(2, h.sent.size)
+        assertEquals(1, h.logged.size)
+        assertEquals(
+            "warn: this key belongs to an app on the other store. Use the iOS app's key in the iOS build and the Android app's key in the Android build; until then both platforms are mixed in one app's reports.",
+            h.logged[0],
+        )
+        assertEquals("the batch is still accepted", 0, h.store.queueSize())
+    }
+
+    @Test
+    fun `a platform warning is logged with debug on and after a quota answer`() = runTest {
+        val h = Harness(testScheduler, statuses = listOf(402), bodies = listOf("{\"warnings\":[\"platform_mismatch\"]}"))
+        val sdk = h.make(debug = true)
+        sdk.start()
+        sdk.flush(true)
+        assertEquals(1, h.logged.count { it.contains("other store") })
+    }
+
+    @Test
+    fun `a platform warning stays quiet in a release build`() = runTest {
+        val h = Harness(testScheduler, bodies = listOf("{\"accepted\":1,\"warnings\":[\"platform_mismatch\"]}"))
+        val sdk = h.make()
+        sdk.start()
+        sdk.flush(true)
+        assertEquals(emptyList<String>(), h.logged)
+    }
+
+    @Test
+    fun `a missing or malformed response body has no warnings`() = runTest {
+        assertEquals(emptyList<String>(), readWarnings(null))
+        assertEquals(emptyList<String>(), readWarnings(""))
+        assertEquals(emptyList<String>(), readWarnings("<html>Bad Gateway</html>"))
+        assertEquals(emptyList<String>(), readWarnings("[\"platform_mismatch\"]"))
+        assertEquals(emptyList<String>(), readWarnings("{\"warnings\":\"platform_mismatch\"}"))
+        assertEquals(listOf("platform_mismatch"), readWarnings("{\"warnings\":[\"platform_mismatch\",null,{}]}"))
+
+        // A rejected batch's body is not read for warnings.
+        val h = Harness(
+            testScheduler,
+            statuses = listOf(400, 202),
+            context = DeviceContext(osVersion = "15", testDevice = true),
+            bodies = listOf("{\"warnings\":[\"platform_mismatch\"]}", "not json"),
+        )
+        val sdk = h.make()
+        sdk.start()
+        sdk.flush(true)
+        sdk.track("again", null, null)
+        tick()
+        sdk.flush(true)
+        assertEquals(2, h.sent.size)
+        assertEquals(emptyList<String>(), h.logged)
+    }
+
+    @Test
     fun `disabled sends nothing`() = runTest {
         val h = Harness(testScheduler)
         val sdk = h.make(disabled = true)
